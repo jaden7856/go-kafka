@@ -1,243 +1,156 @@
 package main
 
 import (
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
-	"net/http"
 	"os"
 	"strings"
-	"time"
+
+	"github.com/rcrowley/go-metrics"
 
 	"github.com/Shopify/sarama"
+	"github.com/jaden7856/go-kafka/tls"
 )
 
 var (
-	addr      = flag.String("addr", ":8080", "The address to bind to")
-	brokers   = flag.String("brokers", os.Getenv("KAFKA_PEERS"), "The Kafka brokers to connect to, as a comma separated list")
-	verbose   = flag.Bool("verbose", false, "Turn on Sarama logging")
-	certFile  = flag.String("certificate", "", "The optional certificate file for client authentication")
-	keyFile   = flag.String("key", "", "The optional key file for client authentication")
-	caFile    = flag.String("ca", "", "The optional certificate authority file for TLS client authentication")
-	verifySsl = flag.Bool("verify", false, "Optional verify ssl certificates chain")
+	brokerList    = flag.String("brokers", os.Getenv("KAFKA_PEERS"), "The comma separated list of brokers in the Kafka cluster. You can also set the KAFKA_PEERS environment variable")
+	headers       = flag.String("headers", "", "The headers of the message to produce. Example: -headers=foo:bar,bar:foo")
+	topic         = flag.String("topic", "", "REQUIRED: the topic to produce to")
+	key           = flag.String("key", "", "The key of the message to produce. Can be empty.")
+	value         = flag.String("value", "", "REQUIRED: the value of the message to produce. You can also provide the value on stdin.")
+	partitioner   = flag.String("partitioner", "", "The partitioning scheme to use. Can be `hash`, `manual`, or `random`")
+	partition     = flag.Int("partition", -1, "The partition to produce to.")
+	showMetrics   = flag.Bool("metrics", false, "Output metrics on successful publish to stderr")
+	silent        = flag.Bool("silent", false, "Turn off printing the message's topic, partition, and offset to stdout")
+	tlsEnabled    = flag.Bool("tls-enabled", false, "Whether to enable TLS")
+	tlsSkipVerify = flag.Bool("tls-skip-verify", false, "Whether skip TLS server cert verification")
+	tlsClientCert = flag.String("tls-client-cert", "", "Client cert for client authentication (use with -tls-enabled and -tls-client-key)")
+	tlsClientKey  = flag.String("tls-client-key", "", "Client key for client authentication (use with tls-enabled and -tls-client-cert)")
+
+	logger = log.New(os.Stderr, "", log.LstdFlags)
 )
 
 func main() {
 	flag.Parse()
 
-	if *verbose {
-		sarama.Logger = log.New(os.Stdout, "[sarama] ", log.LstdFlags)
+	if *brokerList == "" {
+		printUsageErrorAndExit("no -brokers specified. Alternatively, set the KAFKA_PEERS environment variable")
 	}
 
-	if *brokers == "" {
-		flag.PrintDefaults()
-		os.Exit(1)
+	if *topic == "" {
+		printUsageErrorAndExit("no -topic specified")
 	}
 
-	brokerList := strings.Split(*brokers, ",")
-	log.Printf("Kafka brokers: %s", strings.Join(brokerList, ", "))
+	config := sarama.NewConfig()
+	config.Producer.RequiredAcks = sarama.WaitForAll
+	config.Producer.Return.Successes = true
 
-	server := &Server{
-		DataCollector:     newDataCollector(brokerList),
-		AccessLogProducer: newAccessLogProducer(brokerList),
+	if *tlsEnabled {
+		tlsConfig, err := tls.NewConfig(*tlsClientCert, *tlsClientKey)
+		if err != nil {
+			printErrorAndExit(69, "Failed to create TLS config: %s", err)
+		}
+
+		config.Net.TLS.Enable = true
+		config.Net.TLS.Config = tlsConfig
+		config.Net.TLS.Config.InsecureSkipVerify = *tlsSkipVerify
+	}
+
+	switch *partitioner {
+	case "":
+		if *partition >= 0 {
+			config.Producer.Partitioner = sarama.NewManualPartitioner
+		} else {
+			config.Producer.Partitioner = sarama.NewHashPartitioner
+		}
+	case "hash":
+		config.Producer.Partitioner = sarama.NewHashPartitioner
+	case "random":
+		config.Producer.Partitioner = sarama.NewRandomPartitioner
+	case "manual":
+		config.Producer.Partitioner = sarama.NewManualPartitioner
+		if *partition == -1 {
+			printUsageErrorAndExit("-partition is required when partitioning manually")
+		}
+	default:
+		printUsageErrorAndExit(fmt.Sprintf("Partitioner %s not supported.", *partitioner))
+	}
+
+	message := &sarama.ProducerMessage{Topic: *topic, Partition: int32(*partition)}
+
+	if *key != "" {
+		message.Key = sarama.StringEncoder(*key)
+	}
+
+	if *value != "" {
+		message.Value = sarama.StringEncoder(*value)
+	} else if stdinAvailable() {
+		bytes, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			printErrorAndExit(66, "Failed to read data from the standard input: %s", err)
+		}
+		message.Value = sarama.ByteEncoder(bytes)
+	} else {
+		printUsageErrorAndExit("-value is required, or you have to provide the value on stdin")
+	}
+
+	if *headers != "" {
+		var hdrs []sarama.RecordHeader
+		arrHdrs := strings.Split(*headers, ",")
+		for _, h := range arrHdrs {
+			if header := strings.Split(h, ":"); len(header) != 2 {
+				printUsageErrorAndExit("-header should be key:value. Example: -headers=foo:bar,bar:foo")
+			} else {
+				hdrs = append(hdrs, sarama.RecordHeader{
+					Key:   []byte(header[0]),
+					Value: []byte(header[1]),
+				})
+			}
+		}
+
+		if len(hdrs) != 0 {
+			message.Headers = hdrs
+		}
+	}
+
+	producer, err := sarama.NewSyncProducer(strings.Split(*brokerList, ","), config)
+	if err != nil {
+		printErrorAndExit(69, "Failed to open Kafka producer: %s", err)
 	}
 	defer func() {
-		if err := server.Close(); err != nil {
-			log.Println("Failed to close server", err)
+		if err := producer.Close(); err != nil {
+			logger.Println("Failed to close Kafka producer cleanly:", err)
 		}
 	}()
 
-	log.Fatal(server.Run(*addr))
-}
-
-func createTlsConfiguration() (t *tls.Config) {
-	if *certFile != "" && *keyFile != "" && *caFile != "" {
-		cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		caCert, err := os.ReadFile(*caFile)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		caCertPool := x509.NewCertPool()
-		caCertPool.AppendCertsFromPEM(caCert)
-
-		t = &tls.Config{
-			Certificates:       []tls.Certificate{cert},
-			RootCAs:            caCertPool,
-			InsecureSkipVerify: *verifySsl,
-		}
-	}
-	// will be nil by default if nothing is provided
-	return t
-}
-
-type Server struct {
-	DataCollector     sarama.SyncProducer
-	AccessLogProducer sarama.AsyncProducer
-}
-
-func (s *Server) Close() error {
-	if err := s.DataCollector.Close(); err != nil {
-		log.Println("Failed to shut down data collector cleanly", err)
-	}
-
-	if err := s.AccessLogProducer.Close(); err != nil {
-		log.Println("Failed to shut down access log producer cleanly", err)
-	}
-
-	return nil
-}
-
-func (s *Server) Handler() http.Handler {
-	return s.withAccessLog(s.collectQueryStringData())
-}
-
-func (s *Server) Run(addr string) error {
-	httpServer := &http.Server{
-		Addr:    addr,
-		Handler: s.Handler(),
-	}
-
-	log.Printf("Listening for requests on %s...\n", addr)
-	return httpServer.ListenAndServe()
-}
-
-func (s *Server) collectQueryStringData() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-
-		// We are not setting a message key, which means that all messages will
-		// be distributed randomly over the different partitions.
-		partition, offset, err := s.DataCollector.SendMessage(&sarama.ProducerMessage{
-			Topic: "important",
-			Value: sarama.StringEncoder(r.URL.RawQuery),
-		})
-
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintf(w, "Failed to store your data: %s", err)
-		} else {
-			// The tuple (topic, partition, offset) can be used as a unique identifier
-			// for a message in a Kafka cluster.
-			fmt.Fprintf(w, "Your data is stored with unique identifier important/%d/%d", partition, offset)
-		}
-	})
-}
-
-type accessLogEntry struct {
-	Method       string  `json:"method"`
-	Host         string  `json:"host"`
-	Path         string  `json:"path"`
-	IP           string  `json:"ip"`
-	ResponseTime float64 `json:"response_time"`
-
-	encoded []byte
-	err     error
-}
-
-func (ale *accessLogEntry) ensureEncoded() {
-	if ale.encoded == nil && ale.err == nil {
-		ale.encoded, ale.err = json.Marshal(ale)
-	}
-}
-
-func (ale *accessLogEntry) Length() int {
-	ale.ensureEncoded()
-	return len(ale.encoded)
-}
-
-func (ale *accessLogEntry) Encode() ([]byte, error) {
-	ale.ensureEncoded()
-	return ale.encoded, ale.err
-}
-
-func (s *Server) withAccessLog(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		started := time.Now()
-
-		next.ServeHTTP(w, r)
-
-		entry := &accessLogEntry{
-			Method:       r.Method,
-			Host:         r.Host,
-			Path:         r.RequestURI,
-			IP:           r.RemoteAddr,
-			ResponseTime: float64(time.Since(started)) / float64(time.Second),
-		}
-
-		// We will use the client's IP address as key. This will cause
-		// all the access log entries of the same IP address to end up
-		// on the same partition.
-		s.AccessLogProducer.Input() <- &sarama.ProducerMessage{
-			Topic: "access_log",
-			Key:   sarama.StringEncoder(r.RemoteAddr),
-			Value: entry,
-		}
-	})
-}
-
-func newDataCollector(brokerList []string) sarama.SyncProducer {
-	// For the data collector, we are looking for strong consistency semantics.
-	// Because we don't change the flush settings, sarama will try to produce messages
-	// as fast as possible to keep latency low.
-	config := sarama.NewConfig()
-	config.Producer.RequiredAcks = sarama.WaitForAll // Wait for all in-sync replicas to ack the message
-	config.Producer.Retry.Max = 10                   // Retry up to 10 times to produce the message
-	config.Producer.Return.Successes = true
-	tlsConfig := createTlsConfiguration()
-	if tlsConfig != nil {
-		config.Net.TLS.Config = tlsConfig
-		config.Net.TLS.Enable = true
-	}
-
-	// On the broker side, you may want to change the following settings to get
-	// stronger consistency guarantees:
-	// - For your broker, set `unclean.leader.election.enable` to false
-	// - For the topic, you could increase `min.insync.replicas`.
-
-	producer, err := sarama.NewSyncProducer(brokerList, config)
+	partition, offset, err := producer.SendMessage(message)
 	if err != nil {
-		log.Fatalln("Failed to start Sarama producer:", err)
+		printErrorAndExit(69, "Failed to produce message: %s", err)
+	} else if !*silent {
+		fmt.Printf("topic=%s\tpartition=%d\toffset=%d\n", *topic, partition, offset)
 	}
-
-	return producer
+	if *showMetrics {
+		metrics.WriteOnce(config.MetricRegistry, os.Stderr)
+	}
 }
 
-func newAccessLogProducer(brokerList []string) sarama.AsyncProducer {
-	// For the access log, we are looking for AP semantics, with high throughput.
-	// By creating batches of compressed messages, we reduce network I/O at a cost of more latency.
-	config := sarama.NewConfig()
-	tlsConfig := createTlsConfiguration()
-	if tlsConfig != nil {
-		config.Net.TLS.Enable = true
-		config.Net.TLS.Config = tlsConfig
-	}
-	config.Producer.RequiredAcks = sarama.WaitForLocal       // Only wait for the leader to ack
-	config.Producer.Compression = sarama.CompressionSnappy   // Compress messages
-	config.Producer.Flush.Frequency = 500 * time.Millisecond // Flush batches every 500ms
+func printErrorAndExit(code int, format string, values ...interface{}) {
+	fmt.Fprintf(os.Stderr, "ERROR: %s\n", fmt.Sprintf(format, values...))
+	fmt.Fprintln(os.Stderr)
+	os.Exit(code)
+}
 
-	producer, err := sarama.NewAsyncProducer(brokerList, config)
-	if err != nil {
-		log.Fatalln("Failed to start Sarama producer:", err)
-	}
+func printUsageErrorAndExit(message string) {
+	fmt.Fprintln(os.Stderr, "ERROR:", message)
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "Available command line options:")
+	flag.PrintDefaults()
+	os.Exit(64)
+}
 
-	// We will just log to STDOUT if we're not able to produce messages.
-	// Note: messages will only be returned here after all retry attempts are exhausted.
-	go func() {
-		for err := range producer.Errors() {
-			log.Println("Failed to write access log entry:", err)
-		}
-	}()
-
-	return producer
+func stdinAvailable() bool {
+	stat, _ := os.Stdin.Stat()
+	return (stat.Mode() & os.ModeCharDevice) == 0
 }
