@@ -4,32 +4,39 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/rcrowley/go-metrics"
 
 	"github.com/Shopify/sarama"
-	"github.com/jaden7856/go-kafka/tls"
 )
 
-var (
-	brokerList    = flag.String("brokers", os.Getenv("KAFKA_PEERS"), "The comma separated list of brokers in the Kafka cluster. You can also set the KAFKA_PEERS environment variable")
-	headers       = flag.String("headers", "", "The headers of the message to produce. Example: -headers=foo:bar,bar:foo")
-	topic         = flag.String("topic", "", "REQUIRED: the topic to produce to")
-	key           = flag.String("key", "", "The key of the message to produce. Can be empty.")
-	value         = flag.String("value", "", "REQUIRED: the value of the message to produce. You can also provide the value on stdin.")
-	partitioner   = flag.String("partitioner", "", "The partitioning scheme to use. Can be `hash`, `manual`, or `random`")
-	partition     = flag.Int("partition", -1, "The partition to produce to.")
-	showMetrics   = flag.Bool("metrics", false, "Output metrics on successful publish to stderr")
-	silent        = flag.Bool("silent", false, "Turn off printing the message's topic, partition, and offset to stdout")
-	tlsEnabled    = flag.Bool("tls-enabled", false, "Whether to enable TLS")
-	tlsSkipVerify = flag.Bool("tls-skip-verify", false, "Whether skip TLS server cert verification")
-	tlsClientCert = flag.String("tls-client-cert", "", "Client cert for client authentication (use with -tls-enabled and -tls-client-key)")
-	tlsClientKey  = flag.String("tls-client-key", "", "Client key for client authentication (use with tls-enabled and -tls-client-cert)")
+type timeElapsed struct {
+	elapsedTime   time.Duration
+	nSendCntTotal int
+}
 
-	logger = log.New(os.Stderr, "", log.LstdFlags)
+var (
+	brokerList  = flag.String("brokers", os.Getenv("KAFKA_PEERS"), "The comma separated list of brokers in the Kafka cluster. You can also set the KAFKA_PEERS environment variable")
+	topic       = flag.String("topic", "", "REQUIRED: the topic to produce to")
+	key         = flag.String("key", "", "The key of the message to produce. Can be empty.")
+	partitioner = flag.String("partitioner", "", "The partitioning scheme to use. Can be `hash`, `manual`, or `random`")
+	partition   = flag.Int("partition", -1, "The partition to produce to.")
+	showMetrics = flag.Bool("metrics", false, "Output metrics on successful publish to stderr")
+
+	pstLogTime  = flag.String("logtime", "ztime.json", "logtime name")
+	pnPackSize  = flag.Int("size", 512, "packet size")
+	pnPackCount = flag.Int("count", 1000000, "packet count")
+
+	startTime      time.Time
+	wg             sync.WaitGroup
+	srtTimeElapsed []timeElapsed
+
+	nElapsedCnt, nElapsedIx = 0, 0
+	ix, nSendCntTotal       = 0, 0
 )
 
 func main() {
@@ -43,20 +50,18 @@ func main() {
 		printUsageErrorAndExit("no -topic specified")
 	}
 
+	bsBufS := make([]byte, *pnPackSize)
+
+	for ix := 0; ix < *pnPackSize; ix++ {
+		bsBufS[ix] = 'a'
+	}
+
+	nElapsedCnt = *pnPackCount/1000 + 30
+	srtTimeElapsed = make([]timeElapsed, nElapsedCnt)
+
 	config := sarama.NewConfig()
 	config.Producer.RequiredAcks = sarama.WaitForAll
 	config.Producer.Return.Successes = true
-
-	if *tlsEnabled {
-		tlsConfig, err := tls.NewConfig(*tlsClientCert, *tlsClientKey)
-		if err != nil {
-			printErrorAndExit(69, "Failed to create TLS config: %s", err)
-		}
-
-		config.Net.TLS.Enable = true
-		config.Net.TLS.Config = tlsConfig
-		config.Net.TLS.Config.InsecureSkipVerify = *tlsSkipVerify
-	}
 
 	switch *partitioner {
 	case "":
@@ -78,15 +83,24 @@ func main() {
 		printUsageErrorAndExit(fmt.Sprintf("Partitioner %s not supported.", *partitioner))
 	}
 
+	fpTime, _ := os.OpenFile(*pstLogTime, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	defer func(fpTime *os.File) {
+		if err := fpTime.Close(); err != nil {
+			fmt.Println("Failed open file")
+		}
+	}(fpTime)
+
+	// 시작 시간
+	startTime = time.Now()
+
 	message := &sarama.ProducerMessage{Topic: *topic, Partition: int32(*partition)}
 
 	if *key != "" {
 		message.Key = sarama.StringEncoder(*key)
 	}
 
-	if *value != "" {
-		message.Value = sarama.StringEncoder(*value)
-	} else if stdinAvailable() {
+	message.Value = sarama.StringEncoder(bsBufS)
+	if stdinAvailable() {
 		bytes, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			printErrorAndExit(66, "Failed to read data from the standard input: %s", err)
@@ -96,44 +110,66 @@ func main() {
 		printUsageErrorAndExit("-value is required, or you have to provide the value on stdin")
 	}
 
-	if *headers != "" {
-		var hdrs []sarama.RecordHeader
-		arrHdrs := strings.Split(*headers, ",")
-		for _, h := range arrHdrs {
-			if header := strings.Split(h, ":"); len(header) != 2 {
-				printUsageErrorAndExit("-header should be key:value. Example: -headers=foo:bar,bar:foo")
-			} else {
-				hdrs = append(hdrs, sarama.RecordHeader{
-					Key:   []byte(header[0]),
-					Value: []byte(header[1]),
-				})
-			}
-		}
-
-		if len(hdrs) != 0 {
-			message.Headers = hdrs
-		}
-	}
-
 	producer, err := sarama.NewSyncProducer(strings.Split(*brokerList, ","), config)
 	if err != nil {
 		printErrorAndExit(69, "Failed to open Kafka producer: %s", err)
 	}
 	defer func() {
 		if err := producer.Close(); err != nil {
-			logger.Println("Failed to close Kafka producer cleanly:", err)
+			fmt.Println("Failed to close Kafka producer cleanly:", err)
 		}
 	}()
 
-	partition, offset, err := producer.SendMessage(message)
-	if err != nil {
-		printErrorAndExit(69, "Failed to produce message: %s", err)
-	} else if !*silent {
-		fmt.Printf("topic=%s\tpartition=%d\toffset=%d\n", *topic, partition, offset)
-	}
+	// 수신
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		for ix = 0; ix < *pnPackCount; ix++ {
+			nSendCntTotal++
+
+			partition, offset, err := producer.SendMessage(message)
+			if err != nil {
+				printErrorAndExit(69, "Failed to produce message: %s", err)
+			}
+			fmt.Printf("topic=%s\tpartition=%d\toffset=%d\n", *topic, partition, offset)
+
+			// 경과 시간 저장
+			if nSendCntTotal == 1 ||
+				(nSendCntTotal >= 10 && nSendCntTotal < 100 && nSendCntTotal%10 == 0) ||
+				(nSendCntTotal >= 100 && nSendCntTotal < 1000 && nSendCntTotal%100 == 0) ||
+				(nSendCntTotal%1000 == 0) {
+				if nElapsedIx < nElapsedCnt {
+					srtTimeElapsed[nElapsedIx].nSendCntTotal = nSendCntTotal
+					srtTimeElapsed[nElapsedIx].elapsedTime = time.Since(startTime)
+					nElapsedIx++
+				} else {
+					fmt.Printf("[W] ElapsedIx(%d) < ELASPIX\n", nElapsedIx)
+				}
+			}
+		}
+	}()
+
 	if *showMetrics {
 		metrics.WriteOnce(config.MetricRegistry, os.Stderr)
 	}
+
+	// 타임로그 작성
+	if nElapsedIx < nElapsedCnt {
+		srtTimeElapsed[nElapsedIx].nSendCntTotal = nSendCntTotal + 1
+		srtTimeElapsed[nElapsedIx].elapsedTime = time.Since(startTime)
+		nElapsedIx++
+	}
+	for ix = 0; ix < nElapsedCnt; ix++ {
+		if srtTimeElapsed[ix].nSendCntTotal > 0 {
+			fmt.Fprintf(fpTime, "{ \"index\" : { \"_index\" : \"commspeed\", \"_type\" : \"record\", \"_id\" : \"%v\" } }\n{\"sync\":\"async\", \"packsize\":%d, \"packcnt\":%d, \"escount\":%d, \"estime\":%v}\n",
+				time.Now().UnixNano(), *pnPackSize, *pnPackCount, srtTimeElapsed[ix].nSendCntTotal, srtTimeElapsed[ix].elapsedTime)
+		}
+	}
+
+	// 종료
+	_ = fpTime.Close()
+	fmt.Println("End")
 }
 
 func printErrorAndExit(code int, format string, values ...interface{}) {
