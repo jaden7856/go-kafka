@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"sync"
@@ -34,12 +33,14 @@ var (
 	startTime      time.Time
 	wg             sync.WaitGroup
 	srtTimeElapsed []timeElapsed
-
-	nElapsedCnt, nElapsedIx = 0, 0
-	ix, nSendCntTotal       = 0, 0
 )
 
 func main() {
+	var (
+		nElapsedCnt, nElapsedIx = 0, 0
+		ix, nSendCntTotal       = 0, 0
+	)
+
 	flag.Parse()
 
 	if *brokerList == "" {
@@ -74,6 +75,8 @@ func main() {
 		config.Producer.Partitioner = sarama.NewHashPartitioner
 	case "random":
 		config.Producer.Partitioner = sarama.NewRandomPartitioner
+	case "roundrobin":
+		config.Producer.Partitioner = sarama.NewRoundRobinPartitioner
 	case "manual":
 		config.Producer.Partitioner = sarama.NewManualPartitioner
 		if *partition == -1 {
@@ -84,46 +87,34 @@ func main() {
 	}
 
 	fpTime, _ := os.OpenFile(*pstLogTime, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	defer func(fpTime *os.File) {
-		if err := fpTime.Close(); err != nil {
-			fmt.Println("Failed open file")
-		}
-	}(fpTime)
 
 	// 시작 시간
 	startTime = time.Now()
 
-	message := &sarama.ProducerMessage{Topic: *topic, Partition: int32(*partition)}
-
-	if *key != "" {
-		message.Key = sarama.StringEncoder(*key)
-	}
-
-	message.Value = sarama.StringEncoder(bsBufS)
-	if stdinAvailable() {
-		bytes, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			printErrorAndExit(66, "Failed to read data from the standard input: %s", err)
-		}
-		message.Value = sarama.ByteEncoder(bytes)
-	} else {
-		printUsageErrorAndExit("-value is required, or you have to provide the value on stdin")
-	}
-
-	producer, err := sarama.NewSyncProducer(strings.Split(*brokerList, ","), config)
-	if err != nil {
-		printErrorAndExit(69, "Failed to open Kafka producer: %s", err)
-	}
-	defer func() {
-		if err := producer.Close(); err != nil {
-			fmt.Println("Failed to close Kafka producer cleanly:", err)
-		}
-	}()
-
 	// 수신
 	wg.Add(1)
 	go func() {
+
 		defer wg.Done()
+
+		message := &sarama.ProducerMessage{Topic: *topic, Partition: int32(*partition)}
+
+		if *key != "" {
+			message.Key = sarama.StringEncoder(*key)
+		}
+
+		message.Value = sarama.ByteEncoder(bsBufS)
+
+		producer, err := sarama.NewSyncProducer(strings.Split(*brokerList, ","), config)
+		if err != nil {
+			printErrorAndExit(69, "Failed to open Kafka producer: %s", err)
+		}
+
+		defer func() {
+			if err := producer.Close(); err != nil {
+				fmt.Println("Failed to close Kafka producer cleanly:", err)
+			}
+		}()
 
 		for ix = 0; ix < *pnPackCount; ix++ {
 			nSendCntTotal++
@@ -149,6 +140,8 @@ func main() {
 			}
 		}
 	}()
+
+	wg.Wait()
 
 	if *showMetrics {
 		metrics.WriteOnce(config.MetricRegistry, os.Stderr)
@@ -184,9 +177,4 @@ func printUsageErrorAndExit(message string) {
 	fmt.Fprintln(os.Stderr, "Available command line options:")
 	flag.PrintDefaults()
 	os.Exit(64)
-}
-
-func stdinAvailable() bool {
-	stat, _ := os.Stdin.Stat()
-	return (stat.Mode() & os.ModeCharDevice) == 0
 }
