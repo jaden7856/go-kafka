@@ -4,6 +4,8 @@
 
 #  -9 go-client
 topic="test2"
+partitioner="roundrobin"
+partition=10
 
 export KAFKA_PEERS=192.168.33.131:9092,192.168.33.132:9092,192.168.33.133:9092
 
@@ -20,8 +22,8 @@ then
     do
       sLogName=ztime-producer-$nSize-part3.json
 
-      echo "./producer -topic=$topic -size=$nSize -count=$nCount -logtime=$sLogName"
-      ./producer -topic=$topic -size=$nSize -count="$nCount" -logtime=$sLogName
+      echo "./producer -topic=$topic -size=$nSize -count=$nCount -logtime=$sLogName -partitioner=$partitioner -partition=$partition"
+      ./producer -topic=$topic -size=$nSize -count="$nCount" -logtime=$sLogName -partitioner=$partitioner -partition=$partition
 
       if [ "$?" == "0" ]
       then
