@@ -22,7 +22,7 @@ var (
 	brokerList  = flag.String("brokers", os.Getenv("KAFKA_PEERS"), "The comma separated list of brokers in the Kafka cluster. You can also set the KAFKA_PEERS environment variable")
 	topic       = flag.String("topic", "", "REQUIRED: the topic to produce to")
 	key         = flag.String("key", "", "The key of the message to produce. Can be empty.")
-	partitioner = flag.String("partitioner", "", "The partitioning scheme to use. Can be `hash`, `manual`, or `random`")
+	partitioner = flag.String("partitioner", "", "The partitioning scheme to use. Can be `hash`, `manual`, or `random`, `roundrobin`")
 	partition   = flag.Int("partition", -1, "The partition to produce to.")
 	showMetrics = flag.Bool("metrics", false, "Output metrics on successful publish to stderr")
 
